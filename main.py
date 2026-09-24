@@ -1,22 +1,25 @@
 """
 Thailand Ports Map - เว็บแผนที่ท่าเรือ (สไตล์ Searates)
-รัน:  streamlit run app.py
 
-ติดตั้ง:  pip install streamlit folium streamlit-folium pandas
+เวอร์ชันนี้:
+- ใช้ไลบรารี searoute คำนวณ "เส้นทางเดินเรือจริง" (อ้อมแหลม ผ่านช่องแคบ ไม่ตัดผ่านแผ่นดิน)
+- เปลี่ยนแผนที่พื้นหลังเป็น OpenStreetMap (ไม่ต้องใช้ API key)
+- แก้สีตัวหนังสือใน legend
 
-หมายเหตุ: พิกัดด้านล่างเป็นค่าประมาณ สำหรับใช้ตัวอย่างเท่านั้น
-          ควรตรวจสอบกับแหล่งข้อมูลจริง (เช่น การท่าเรือแห่งประเทศไทย) แล้วอ้างอิงในรายงาน
+หมายเหตุ: พิกัดท่าเรือเป็นค่าประมาณ ควรตรวจกับแหล่งข้อมูลจริงและอ้างอิงในรายงาน
 """
 
 import math
+from functools import lru_cache
 
 import folium
 import pandas as pd
+import searoute as sr
 import streamlit as st
 from streamlit_folium import st_folium
 
 # ---------------------------------------------------------------
-# 1) ข้อมูลท่าเรือ (แก้/เพิ่มได้ หรือโหลดจาก ports.csv แทน)
+# 1) ข้อมูลท่าเรือ
 #    type: "sea" = ท่าเรือทะเล/แม่น้ำ, "container" = ตู้คอนเทนเนอร์
 # ---------------------------------------------------------------
 PORTS = [
@@ -35,32 +38,58 @@ COLORS = {"sea": "#0b0f3b", "container": "#e0405e"}
 LABELS = {"sea": "ท่าเรือทะเล / ท่าเรือแม่น้ำ", "container": "ตู้คอนเทนเนอร์"}
 
 
-def haversine_km(a, b):
-    """ระยะทางเส้นตรงบนผิวโลก (กม.)"""
+# ---------------------------------------------------------------
+# 2) ระยะทาง
+# ---------------------------------------------------------------
+def haversine_km(lat1, lon1, lat2, lon2):
+    """ระยะเส้นตรง (ใช้สำรองเมื่อคำนวณเส้นทางเรือไม่ได้)"""
     r = 6371.0
-    p1, p2 = math.radians(a["lat"]), math.radians(b["lat"])
+    p1, p2 = math.radians(lat1), math.radians(lat2)
     dphi = p2 - p1
-    dlmb = math.radians(b["lon"] - a["lon"])
+    dlmb = math.radians(lon2 - lon1)
     h = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
     return 2 * r * math.asin(math.sqrt(h))
 
 
+@lru_cache(maxsize=None)
+def sea_leg(lat1, lon1, lat2, lon2):
+    """
+    คืนค่า (พิกัดเส้นทาง [[lat, lon], ...], ระยะทาง กม., เป็นเส้นทางเรือจริงหรือไม่)
+    searoute ใช้รูปแบบ [lon, lat]
+    """
+    try:
+        r = sr.searoute([lon1, lat1], [lon2, lat2], units="km")
+        coords = [[c[1], c[0]] for c in r["geometry"]["coordinates"]]
+        km = float(r["properties"]["length"])
+        return coords, km, True
+    except Exception:
+        km = haversine_km(lat1, lon1, lat2, lon2)
+        return [[lat1, lon1], [lat2, lon2]], km, False
+
+
+def leg(a, b):
+    return sea_leg(a["lat"], a["lon"], b["lat"], b["lon"])
+
+
 def solve_route(depot, customers):
     """
-    ตัวอย่าง solver แบบ Nearest Neighbor สำหรับ OVRP (ไม่ต้องกลับ depot)
-    ภายหลังเปลี่ยนเป็น solver ของทีม (OR-Tools ฯลฯ) ได้ โดยคืนค่า list ของท่าตามลำดับ
+    ตัวอย่าง solver แบบ Nearest Neighbor สำหรับ OVRP (ไม่กลับ depot)
+    ใช้ระยะทางเดินเรือจริง ภายหลังเปลี่ยนเป็น solver ของทีมได้
     """
     route, current, left = [depot], depot, list(customers)
     while left:
-        nxt = min(left, key=lambda c: haversine_km(current, c))
+        nxt = min(left, key=lambda c: leg(current, c)[1])
         route.append(nxt)
         left.remove(nxt)
         current = nxt
     return route
 
 
-def build_map(ports, route=None):
-    m = folium.Map(location=[13.0, 100.5], zoom_start=6, tiles="CartoDB positron")
+# ---------------------------------------------------------------
+# 3) แผนที่
+# ---------------------------------------------------------------
+def build_map(ports, path=None):
+    m = folium.Map(location=[10.5, 100.5], zoom_start=6, tiles="OpenStreetMap")
 
     for p in ports:
         folium.CircleMarker(
@@ -79,18 +108,13 @@ def build_map(ports, route=None):
             ),
         ).add_to(m)
 
-    if route and len(route) > 1:
-        folium.PolyLine(
-            [[p["lat"], p["lon"]] for p in route],
-            color="#2f6fed",
-            weight=4,
-            opacity=0.8,
-        ).add_to(m)
+    if path:
+        folium.PolyLine(path, color="#2f6fed", weight=4, opacity=0.85).add_to(m)
 
     legend = """
     <div style="position: fixed; top: 12px; left: 50px; z-index: 9999;
                 background: white; padding: 10px 14px; border-radius: 8px;
-                box-shadow: 0 2px 8px rgba(0,0,0,.25); font-size: 13px;">
+                box-shadow: 0 2px 8px rgba(0,0,0,.25); font-size: 13px; color: #222;">
       <b>Thailand</b><br>
       <span style="color:#0b0f3b;">&#9679;</span> ท่าเรือทะเล / ท่าเรือแม่น้ำ<br>
       <span style="color:#e0405e;">&#9679;</span> ตู้คอนเทนเนอร์
@@ -101,7 +125,7 @@ def build_map(ports, route=None):
 
 
 # ---------------------------------------------------------------
-# 2) หน้าเว็บ (Streamlit)
+# 4) หน้าเว็บ (Streamlit)
 # ---------------------------------------------------------------
 st.set_page_config(page_title="Thailand Ports", layout="wide")
 st.title("Thailand Ports")
@@ -126,19 +150,28 @@ with st.sidebar:
 
 filtered = [p for p in PORTS if p["type"] in types]
 
-route = None
+route, path, total, all_real = None, None, 0.0, True
 if show_route and cust_names:
     depot = next(p for p in PORTS if p["name"] == depot_name)
     customers = [p for p in PORTS if p["name"] in cust_names]
     route = solve_route(depot, customers)
 
-st_folium(build_map(filtered, route), height=520, returned_objects=[])
+    path = []
+    for a, b in zip(route[:-1], route[1:]):
+        coords, km, real = leg(a, b)
+        path.extend(coords)
+        total += km
+        all_real = all_real and real
+
+st_folium(build_map(filtered, path), height=520, returned_objects=[])
 
 if route:
-    total = sum(haversine_km(route[i], route[i + 1]) for i in range(len(route) - 1))
     st.subheader("ผลเส้นทาง")
     st.write(" → ".join(p["name"] for p in route))
-    st.metric("ระยะทางรวม (เส้นตรง)", f"{total:,.1f} กม.")
+    label = "ระยะทางรวม (เดินเรือ)" if all_real else "ระยะทางรวม (เส้นตรง - สำรอง)"
+    st.metric(label, f"{total:,.1f} กม.")
+    if not all_real:
+        st.warning("คำนวณเส้นทางเรือบางช่วงไม่ได้ จึงใช้ระยะเส้นตรงแทน")
 
 st.subheader("รายการท่าเรือ")
 show_df = pd.DataFrame(filtered)
